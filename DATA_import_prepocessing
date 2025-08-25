@@ -1,0 +1,100 @@
+library(stringr)
+library(dplyr)
+library(MSnbase)
+library(limma)
+library(EnhancedVolcano)
+library(ComplexHeatmap)
+library(reshape2)
+library(ggpubr)
+
+
+#import, cleanup and preprocessing ----
+data <- read.delim2("data/20240416_131249_PCF000048-RC_Report_ProteinGroups-noCrossRunNormalization.tsv")
+data<-data[,c(3,4,1,7:22)]
+colnames(data) <- c("gene", "full_name", "uniprot", 
+                    paste(c(rep("IgG", 4), rep("NCSTN",4),rep("g_secretase_WT", 4), rep("g_secretase_DA", 4)),c(1:4,1:4,1:4,1:4), sep="_"))
+
+
+data<-data[!grepl("Keratin.+", data$full_name),]
+data<- data[!(grepl("Immunoglobulin.*", data$full_name)), ]
+data<- data[!(grepl("NCSTN|PSEN1|PSENEN|APH1B", data$gene)), ]
+
+
+position <- as.vector(str_split(data$uniprot, pattern = ";"))
+gene_1 <- as.vector(str_split(data$gene, pattern = ";"))
+pos <- c()
+for (i in c(1:length(position))) {
+  pos <- c(pos, match(min(nchar(position[[i]])), as.vector(nchar(position[[i]]))))
+}
+uniprot <- c()
+for (i in c(1:length(pos))) { j <- pos[i]
+uniprot <- c(uniprot, position[[i]][j]) }
+gene <- c()
+for (i in c(1:length(pos))) {
+  j <- pos[i]
+  if (length(gene[i])< j) {
+    gene <- c(gene, gene_1[[i]][1])
+  } else {
+    gene <- c(gene, gene_1[[i]][j]) }
+}
+
+data$uniprot <- uniprot
+data$gene <- gene
+rm(position, gene_1, gene, pos, uniprot, i, j)
+mapping<-data[,c("gene", "uniprot")]
+#normalise and impute ----
+samples<-data[,c(12:19)]
+negative<-data[,c(4:7)]
+
+norm_imp<-function(data) {
+  data<-data %>% as.matrix() %>% log2() %>% normalizeMedianValues() %>% imputeLCMD::impute.MinDet()
+}
+samples_processed<-norm_imp(samples)
+negative_processed<-norm_imp(negative)
+
+merged_df<-cbind(data[,c(1:3)], samples_processed, negative_processed)
+
+merged_long<-melt(merged_df)
+
+ggplot(merged_long) + geom_boxplot(aes(x=variable, y=value)) + theme_pubr()+
+  theme(axis.text.x = element_text(angle=90))  + ylab("Intensity") + xlab("")
+
+matrix_intensity<-as.matrix(merged_df[,c(4:length(merged_df))])
+rownames(matrix_intensity)<-merged_df$gene
+
+#differential expression analysis to get total proxiome ----
+
+samples<-data.frame(samples=colnames(matrix_intensity),condition=as.factor(c(rep("sample",8), rep("neg",4))),
+                    mutation=as.factor(c(rep("WT",4), rep("DA",4), rep("neg",4))))
+rownames(samples)<-samples$samples
+
+design = model.matrix(~0+samples$condition)
+colnames(design)<-c("neg", "sample")
+fit1 = lmFit(matrix_intensity,design = design)
+cont <- makeContrasts(contrasts =  "sample - neg", levels = design)
+fit2 = contrasts.fit(fit1,contrasts = cont)
+fit3 <- eBayes(fit2)
+limma.results = topTable(fit3, adjust="BH", sort.by = 'logFC', n=Inf)
+
+EnhancedVolcano(limma.results, lab=rownames(limma.results), x="logFC", y="adj.P.Val", labSize = 2,
+                pCutoff = 0.05, ylim=c(0,12))
+
+interactome<-limma.results %>% subset(logFC>1 & adj.P.Val < 0.05)
+
+
+filtered<-matrix_intensity %>% subset(rownames(matrix_intensity) %in% rownames(interactome))
+filtered<-filtered[,c(1:8)]
+
+design1 = model.matrix(~0+as.factor(as.character(samples$mutation[1:8])))
+colnames(design1)<-c("DA", "WT")
+fit1_1 = lmFit(filtered,design = design1)
+cont1 <- makeContrasts(contrasts =  "DA - WT", levels = design1)
+fit2_1 = contrasts.fit(fit1_1,contrasts = cont1)
+fit3_1 <- eBayes(fit2_1)
+limma.results_diff = topTable(fit3_1, adjust="BH", sort.by = 'logFC', n=Inf)
+EnhancedVolcano(limma.results_diff, lab=rownames(limma.results_diff), x="logFC", y="adj.P.Val", labSize = 3, pCutoff = 0.05,
+                ylim=c(0,1.5), xlim=c(-3,3))
+
+write.csv(limma.results_diff, file="output/TopTable_DA_WT_interactome.csv")
+write.csv(limma.results, file="output/TopTable_sample_bg_interactome.csv")
+write.csv(mapping, file="output/mapping.csv")
