@@ -1,0 +1,344 @@
+# pipeline_min2_fixed.R
+# Based on user's original script; fixes column selection issues and adds:
+# - universal FASTA hard filter
+# - CRAPome annotation (user XLS)
+# - contaminant Policy A (balanced)
+# - mixed imputation: MinDet for ctrl-only missing (bait>=2), QRILC otherwise
+# - if QRILC fails on rows -> log and remove those rows
+# - presence prefilter >=2 (this script)
+#
+# Paths (edit if needed)
+input_file  <- "data/20240416_131249_PCF000048-RC_Report_ProteinGroups-noCrossRunNormalization.tsv"
+crapome_xls <- "/mnt/data/1755773135_userCrapDB.xls"
+fasta_file  <- "/mnt/data/0602_Universal Contaminants.fasta"
+output_dir  <- "output_min2_fixed"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# packages
+suppressPackageStartupMessages({
+  library(stringr)
+  library(dplyr)
+  library(MSnbase)
+  library(limma)
+  library(EnhancedVolcano)
+  library(reshape2)
+  library(ggpubr)
+  library(readxl)
+  library(Biostrings)
+  library(tibble)
+  library(imputeLCMD)   # for MinDet and QRILC
+})
+
+# --- helper to read CRAPome export robustly ---
+read_crapome_xls <- function(path){
+  if(!file.exists(path)) return(NULL)
+  df <- readxl::read_excel(path, sheet = 1)
+  names(df) <- make.names(names(df))
+  gene_col <- names(df)[which(tolower(names(df)) %in% c("gene","genes","gene.symbol","gene_symbol","geneid"))][1]
+  if(is.na(gene_col)) gene_col <- names(df)[1]
+  freq_col <- names(df)[which(grepl("freq|frequency|percent|pct|perc", tolower(names(df))))][1]
+  occ_col  <- names(df)[which(grepl("occurr|occurrence|occurrences|n.present|present", tolower(names(df))))][1]
+  total_col<- names(df)[which(grepl("total|n.total|num.experiments|experiments", tolower(names(df))))][1]
+  if(!is.na(freq_col)){
+    freq <- df[[freq_col]]
+    if(max(freq, na.rm=TRUE) > 1) freq <- freq / 100
+  } else if(!is.na(occ_col) && !is.na(total_col)){
+    freq <- df[[occ_col]] / df[[total_col]]
+  } else {
+    numeric_cols <- sapply(df, is.numeric)
+    if(sum(numeric_cols) >= 3){
+      mat <- as.matrix(df[, numeric_cols])
+      freq <- rowSums(mat > 0, na.rm=TRUE) / ncol(mat)
+    } else {
+      freq <- rep(NA_real_, nrow(df))
+    }
+  }
+  tibble(gene = as.character(df[[gene_col]]), crapome_freq = as.numeric(freq)) %>% distinct()
+}
+
+# --- helper to parse universal FASTA headers to accession tokens ---
+read_universal_fasta_accessions <- function(path){
+  if(!file.exists(path)) return(character(0))
+  aa <- Biostrings::readAAStringSet(path, format = "fasta")
+  hdrs <- names(aa)
+  accs <- sapply(hdrs, function(h){
+    if(grepl("^\\w+\\|", h)){
+      sub("^\\w+\\|([^|]+)\\|.*$", "\\1", h)
+    } else {
+      strsplit(h, "\\s+")[[1]][1]
+    }
+  }, USE.NAMES = FALSE)
+  unique(accs)
+}
+
+# --- Load CRAPome and FASTA ---
+crapome_tbl <- read_crapome_xls(crapome_xls)   # may be NULL if not found
+univ_accs   <- read_universal_fasta_accessions(fasta_file)  # vector of accessions (e.g. P12345)
+
+# --- Load original data (your code) ---
+data <- read.delim2(input_file, stringsAsFactors = FALSE, na.strings = c("", "NA"))
+data <- data[,c(3,4,1,7:22)]
+colnames(data) <- c("gene", "full_name", "uniprot",
+                    paste(c(rep("IgG", 4), rep("NCSTN",4), rep("g_secretase_WT", 4), rep("g_secretase_DA", 4)),
+                          c(1:4,1:4,1:4,1:4), sep="_"))
+
+# textual filters you used
+data <- data[!grepl("Keratin.+", data$full_name), ]
+data <- data[!(grepl("Immunoglobulin.*", data$full_name)), ]
+data <- data[!(grepl("NCSTN|PSEN1|PSENEN|APH1B", data$gene)), ]
+
+# collapse semicolon tokens like you did (shortest uniprot token, first gene token)
+position <- as.vector(str_split(data$uniprot, pattern = ";"))
+gene_1 <- as.vector(str_split(data$gene, pattern = ";"))
+pos <- c()
+for (i in seq_along(position)) {
+  pos <- c(pos, match(min(nchar(position[[i]])), as.vector(nchar(position[[i]]))))
+}
+uniprot <- c()
+for (i in seq_along(pos)) { j <- pos[i]
+uniprot <- c(uniprot, position[[i]][j]) }
+gene <- c()
+for (i in seq_along(pos)) {
+  j <- pos[i]
+  if (length(gene[i])< j) {
+    gene <- c(gene, gene_1[[i]][1])
+  } else {
+    gene <- c(gene, gene_1[[i]][j]) }
+}
+data$uniprot <- uniprot
+data$gene <- gene
+rm(position, gene_1, gene, pos, uniprot, i, j)
+mapping <- data[,c("gene","uniprot")]
+
+# --- Universal FASTA hard filter (match by Uniprot accession tokens if present) ---
+if(length(univ_accs) > 0){
+  univ_mask <- data$uniprot %in% univ_accs
+  cat("Universal FASTA contaminants matched:", sum(univ_mask), "\n")
+  data <- data[!univ_mask, , drop = FALSE]
+} else {
+  cat("No universal FASTA entries loaded (or file not found) - skipping that hard filter.\n")
+}
+
+# --- Build sample matrices EXACTLY as in your original script (keeps column indexing) ---
+# samples (baits) = columns 12:19 in original data (g_secretase_WT_1..4, g_secretase_DA_1..4)
+samples_mat  <- data[, c(12:19)]
+negative_mat <- data[, c(4:7)]   # IgG controls (4 replicates)
+
+# ensure numeric
+samples_mat <- apply(samples_mat, 2, function(x) as.numeric(as.character(x)))
+negative_mat <- apply(negative_mat, 2, function(x) as.numeric(as.character(x)))
+
+# combine for later keeping original ordering: (samples then negatives) but we'll keep mixed imputation logic
+combined_mat <- cbind(samples_mat, negative_mat)
+rownames(combined_mat) <- data$gene
+
+# --- Pre-imputation: compute IgG presence frequency (before any imputation) ---
+nonNA <- function(x) !is.na(x) & is.finite(x)
+IgG_presence_count <- rowSums(nonNA(negative_mat))
+data$IgG_freq <- IgG_presence_count / ncol(negative_mat)
+
+# --- Merge CRAPome freq into data if available (by gene symbol) ---
+if(!is.null(crapome_tbl)){
+  data <- left_join(data, crapome_tbl, by = "gene")
+} else {
+  data$crapome_freq <- NA_real_
+}
+
+# ---- Contaminant Policy A: balanced ----
+TH_IgG_high     <- 0.75
+TH_IgG_med      <- 0.5
+TH_crapome_hard <- 0.50
+TH_crapome_warn <- 0.25
+
+data <- data %>%
+  mutate(
+    crapome_freq = ifelse(is.na(crapome_freq), 0, crapome_freq),
+    high_IgG = IgG_freq >= TH_IgG_high,
+    med_IgG  = IgG_freq >= TH_IgG_med,
+    high_crapome = crapome_freq >= TH_crapome_hard,
+    med_crapome  = crapome_freq >= TH_crapome_warn & crapome_freq < TH_crapome_hard,
+    hard_remove = (high_IgG & high_crapome),
+    deprioritize = (!hard_remove) & (med_crapome | med_IgG),
+    keep_priority = (!hard_remove) & (!deprioritize)
+  )
+
+cat("Hard remove (both IgG high & CRAPome high):", sum(data$hard_remove), "\n")
+cat("Deprioritize (medium flags):", sum(data$deprioritize), "\n")
+cat("Keep priority:", sum(data$keep_priority), "\n")
+
+# Hard-remove now to avoid biasing imputation/statistics
+to_remove_genes <- data$gene[data$hard_remove]
+if(length(to_remove_genes) > 0){
+  combined_mat <- combined_mat[!(rownames(combined_mat) %in% to_remove_genes), , drop = FALSE]
+  data <- data[data$gene %in% rownames(combined_mat), ]
+}
+
+# --- Presence prefilter: keep proteins present in >=2 bait replicates (WT+DA combined) ---
+MIN_BAIT_PRESENT <- 2
+bait_cols_names <- colnames(samples_mat)
+pres_bait_count <- rowSums(nonNA(combined_mat[, bait_cols_names, drop = FALSE]))
+keep_mask <- pres_bait_count >= MIN_BAIT_PRESENT
+cat("Proteins before presence prefilter:", nrow(combined_mat), "after >=2 bait:", sum(keep_mask), "\n")
+
+combined_prefilt <- combined_mat[keep_mask, , drop = FALSE]
+data_prefilt <- data[data$gene %in% rownames(combined_prefilt), ]
+
+# --- Log2 transform heuristic and median normalization (as in your workflow) ---
+# detect if values are raw intensities (large) or already log
+median_val <- median(combined_prefilt[is.finite(combined_prefilt)], na.rm = TRUE)
+mat_log <- if(median_val > 50) log2(combined_prefilt) else combined_prefilt
+# median normalization per sample (subtract column medians)
+mat_med <- sweep(mat_log, 2, apply(mat_log, 2, median, na.rm = TRUE), FUN = "-")
+
+# --- Mixed imputation: MinDet for ctrl-only (MNAR), QRILC for remaining (MAR)
+# Returns imputed matrix and log of removed rows if any
+impute_mixed_simple <- function(mat, bait_cols, ctrl_cols, min_bait_present = 2){
+  present <- function(x) !is.na(x) & is.finite(x)
+  pres_bait <- rowSums(present(mat[, bait_cols, drop = FALSE]))
+  pres_ctrl <- rowSums(present(mat[, ctrl_cols, drop = FALSE]))
+  imputed <- mat
+  log_df <- tibble::tibble(gene = rownames(mat), pres_bait = pres_bait, pres_ctrl = pres_ctrl, fallback = NA_character_)
+  
+  # Case A: proteins present in >=min_bait_present bait replicates and 0 in IgG -> impute IgG only with MinDet
+  caseA <- pres_bait >= min_bait_present & pres_ctrl == 0
+  if(any(caseA)){
+    sub_ctrl <- as.matrix(imputed[caseA, ctrl_cols, drop = FALSE])
+    imp_ctrl <- tryCatch(imputeLCMD::impute.MinDet(sub_ctrl), error = function(e) {
+      warning("impute.MinDet failed on some ctrl-only rows; leaving NAs for now.")
+      sub_ctrl
+    })
+    imputed[caseA, ctrl_cols] <- imp_ctrl
+    log_df$fallback[caseA] <- "MinDet_on_ctrl"
+  }
+  
+  # Case B: remaining rows that still have any NA -> QRILC on that submatrix
+  need_mar <- which(apply(imputed, 1, function(r) any(is.na(r))))
+  removed_rows <- character(0)
+  if(length(need_mar) > 0){
+    sub_all <- as.matrix(imputed[need_mar, , drop = FALSE])
+    # handle single-row case for QRILC: if only one row, QRILC sometimes returns vector - manage it
+    qr_result <- tryCatch(imputeLCMD::impute.QRILC(sub_all), error = function(e) { warning("QRILC failed: ", conditionMessage(e)); NULL })
+    if(!is.null(qr_result) && !is.null(qr_result$x)){
+      sub_imp <- as.matrix(qr_result$x)
+      # if QRILC returned single-row as vector, coerce accordingly
+      if(is.null(dim(sub_imp))){
+        # vector: length should equal ncol(sub_all)
+        if(length(sub_imp) == ncol(sub_all)){
+          imputed[need_mar, ] <- matrix(sub_imp, nrow = length(need_mar), ncol = ncol(sub_all), byrow = TRUE)
+          log_df$fallback[need_mar] <- paste0(log_df$fallback[need_mar], ";QRILC")
+        } else {
+          warning("QRILC returned unexpected vector length; removing these rows.")
+          removed_rows <- rownames(sub_all)
+        }
+      } else {
+        # check dimensions
+        if(nrow(sub_imp) == nrow(sub_all) && ncol(sub_imp) == ncol(sub_all)){
+          imputed[need_mar, ] <- sub_imp
+          log_df$fallback[need_mar] <- paste0(log_df$fallback[need_mar], ";QRILC")
+        } else if(nrow(sub_imp) == ncol(sub_all) && ncol(sub_imp) == nrow(sub_all)){
+          # try transpose
+          sub_imp_t <- t(sub_imp)
+          if(nrow(sub_imp_t) == nrow(sub_all) && ncol(sub_imp_t) == ncol(sub_all)){
+            imputed[need_mar, ] <- sub_imp_t
+            log_df$fallback[need_mar] <- paste0(log_df$fallback[need_mar], ";QRILC_t")
+          } else {
+            warning("QRILC returned mismatched dims; removing these rows.")
+            removed_rows <- rownames(sub_all)
+          }
+        } else {
+          warning("QRILC returned dims that don't match; removing these rows.")
+          removed_rows <- rownames(sub_all)
+        }
+      }
+    } else {
+      # QRILC failed entirely - remove those rows (logged)
+      removed_rows <- rownames(sub_all)
+    }
+  }
+  
+  # Remove any rows marked for removal
+  if(length(removed_rows) > 0){
+    imputed <- imputed[!(rownames(imputed) %in% removed_rows), , drop = FALSE]
+    log_df <- log_df[!(log_df$gene %in% removed_rows), , drop = FALSE]
+    log_df$final_status <- ifelse(log_df$gene %in% removed_rows, "removed", "kept")
+  } else {
+    log_df$final_status <- "ok"
+  }
+  
+  list(mat = imputed, log = log_df)
+}
+
+bait_cols <- colnames(samples_mat)
+ctrl_cols <- colnames(negative_mat)
+
+imp_res <- impute_mixed_simple(mat_med, bait_cols = bait_cols, ctrl_cols = ctrl_cols, min_bait_present = MIN_BAIT_PRESENT)
+mat_imp_all <- imp_res$mat
+impute_log <- imp_res$log
+write.csv(impute_log, file = file.path(output_dir, "imputation_log_min2.csv"), row.names = FALSE)
+
+cat("After imputation matrix dims:", dim(mat_imp_all), "\n")
+
+# --- Prepare matrix for limma exactly like your original pipeline ---
+# In your original pipeline you constructed merged_df and used columns 4:length()
+# Here we will assemble the same ordering: samples (WT+DA) then IgG (controls)
+bait_WT_cols <- grep("^g_secretase_WT_", colnames(mat_imp_all), value = TRUE)
+bait_DA_cols <- grep("^g_secretase_DA_", colnames(mat_imp_all), value = TRUE)
+bait_cols_all <- c(bait_WT_cols, bait_DA_cols)
+# final matrix: bait cols (8) then IgG cols (4)
+matrix_intensity <- mat_imp_all[, c(bait_cols_all, ctrl_cols), drop = FALSE]
+
+# --- limma: sample vs IgG (same design as your original) ---
+samples_df <- data.frame(samples = colnames(matrix_intensity),
+                         condition = as.factor(c(rep("sample", length(bait_cols_all)), rep("neg", length(ctrl_cols)))),
+                         mutation = as.factor(c(rep("WT", length(bait_WT_cols)), rep("DA", length(bait_DA_cols)), rep("neg", length(ctrl_cols)))),
+                         stringsAsFactors = FALSE)
+rownames(samples_df) <- samples_df$samples
+
+design = model.matrix(~0 + samples_df$condition)
+colnames(design) <- c("neg", "sample")
+fit1 = lmFit(matrix_intensity, design = design)
+cont <- makeContrasts(contrasts = "sample - neg", levels = design)
+fit2 = contrasts.fit(fit1, contrasts = cont)
+fit3 <- eBayes(fit2)
+limma.results = topTable(fit3, adjust="BH", sort.by = 'logFC', n=Inf) %>% tibble::rownames_to_column("gene")
+
+# Volcano (sample vs IgG)
+EnhancedVolcano(limma.results, lab=limma.results$gene, x="logFC", y="adj.P.Val", labSize = 2,
+                pCutoff = 0.05, ylim=c(0,12))
+png(filename = file.path(output_dir, "volcano_sample_vs_IgG_min2_fixed.png"), width = 1600, height = 1200, res = 200)
+EnhancedVolcano(limma.results, lab=limma.results$gene, x="logFC", y="adj.P.Val", labSize = 2,
+                pCutoff = 0.05, ylim=c(0,12))
+dev.off()
+
+# --- Interactome (logFC > 1 & adj.P.Val < 0.05) ---
+interactome <- limma.results %>% subset(logFC > 1 & adj.P.Val < 0.05)
+write.csv(interactome, file = file.path(output_dir, "interactome_min2_logFC1_FDR0.05.csv"), row.names = FALSE)
+
+# --- DA vs WT within interactome (use first 8 columns of matrix_intensity for baits) ---
+if(nrow(interactome) > 0){
+  filtered <- matrix_intensity[rownames(matrix_intensity) %in% interactome$gene, c(1:8), drop = FALSE]
+  # design for DA vs WT: ensure columns are WT then DA
+  # In your original code mutation vector was rep("WT",4) then rep("DA",4)
+  mutation_vec <- c(rep("WT",4), rep("DA",4))
+  design1 <- model.matrix(~0+factor(mutation_vec, levels = c("WT","DA")))
+  colnames(design1) <- c("WT","DA")
+  fit1_1 = lmFit(filtered, design = design1)
+  cont1 <- makeContrasts(contrasts =  "DA - WT", levels = design1)
+  fit2_1 = contrasts.fit(fit1_1,contrasts = cont1)
+  fit3_1 <- eBayes(fit2_1)
+  limma.results_diff = topTable(fit3_1, adjust="BH", sort.by = 'logFC', n=Inf) %>% tibble::rownames_to_column("gene")
+  write.csv(limma.results_diff, file = file.path(output_dir, "TopTable_DA_WT_interactome_min2.csv"), row.names = FALSE)
+  # volcano for DA vs WT
+  png(filename = file.path(output_dir, "volcano_DA_vs_WT_interactome_min2.png"), width = 1400, height = 1000, res = 200)
+  EnhancedVolcano(limma.results_diff, lab=limma.results_diff$gene, x="logFC", y="adj.P.Val", labSize = 3, pCutoff = 0.05,
+                  ylim=c(0,1.5), xlim=c(-3,3))
+  dev.off()
+} else {
+  cat("No interactome rows; skipping DA vs WT.\n")
+}
+
+# --- save outputs and mapping ---
+write.csv(limma.results, file = file.path(output_dir, "TopTable_sample_bg_interactome_min2.csv"), row.names = FALSE)
+write.csv(mapping, file = file.path(output_dir, "mapping_min2.csv"), row.names = FALSE)
+
+cat("Done. Outputs in:", output_dir, "\n")
